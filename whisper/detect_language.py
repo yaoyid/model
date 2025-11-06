@@ -1,26 +1,27 @@
-def detect_language(model: WhisperForConditionalGeneration, tokenizer: WhisperTokenizer, input_features,
-                    possible_languages: Optional[Collection[str]] = None) -> List[Dict[str, float]]:
-    # hacky, but all language tokens and only language tokens are 6 characters long
-    language_tokens = [t for t in tokenizer.additional_special_tokens if len(t) == 6]
-    if possible_languages is not None:
-        language_tokens = [t for t in language_tokens if t[2:-2] in possible_languages]
-        if len(language_tokens) < len(possible_languages):
-            raise RuntimeError(f'Some languages in {possible_languages} did not have associated language tokens')
+import torch
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers.models.whisper.tokenization_whisper import LANGUAGES
 
-    language_token_ids = tokenizer.convert_tokens_to_ids(language_tokens)
+from datasets import load_dataset
 
-    # 50258 is the token for transcribing
-    logits = model(input_features,
-                   decoder_input_ids = torch.tensor([[50258] for _ in range(input_features.shape[0])])).logits
-    mask = torch.ones(logits.shape[-1], dtype=torch.bool)
-    mask[language_token_ids] = False
-    logits[:, :, mask] = -float('inf')
+model_id = "openai/whisper-tiny"
 
-    output_probs = logits.softmax(dim=-1).cpu()
-    return [
-        {
-            lang: output_probs[input_idx, 0, token_id].item()
-            for token_id, lang in zip(language_token_ids, language_tokens)
-        }
-        for input_idx in range(logits.shape[0])
-    ]
+processor = WhisperProcessor.from_pretrained(model_id)
+model = WhisperForConditionalGeneration.from_pretrained(model_id)
+
+bos_token_id = processor.tokenizer.all_special_ids[-106]
+decoder_input_ids = torch.tensor([bos_token_id])
+
+dataset = load_dataset("facebook/multilingual_librispeech", "dutch", split="validation", streaming=True)
+sample = next(iter(dataset))["audio"]
+
+input_features = processor(sample["array"], sampling_rate=sample["sampling_rate"], return_tensors="pt").input_features
+
+with torch.no_grad():
+    logits = model.forward(input_features, decoder_input_ids=decoder_input_ids).logits
+
+pred_ids = torch.argmax(logits, dim=-1)
+lang_ids = processor.decode(pred_ids[0])
+
+lang_ids = lang_ids.lstrip("<|").rstrip("|>")
+language = LANGUAGES[lang_ids]
