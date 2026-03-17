@@ -17,7 +17,9 @@ class BM25InvertedIndex:
         # Transform the index for efficient lookups
         self.index = self._transform_index(self.raw_index)
         
-        self.doc_metadata = self._load_metadata()
+        # Initialize doc_metadata as empty dict (can be set later)
+        self.doc_metadata = {}
+        
         self.k1 = k1
         self.b = b
         
@@ -54,16 +56,6 @@ class BM25InvertedIndex:
             for posting in data['postings']:
                 lookup[term][posting['doc_id']] = posting['tf']
         return lookup
-    
-    def _load_metadata(self, metadata_file: str = None) -> Dict:
-        """Load document metadata if available"""
-        if metadata_file:
-            try:
-                with open(metadata_file, 'r') as f:
-                    return json.load(f)
-            except FileNotFoundError:
-                return {}
-        return {}
     
     def _count_total_docs(self) -> int:
         """Count unique documents across all terms"""
@@ -144,78 +136,6 @@ class BM25InvertedIndex:
         """Simple query tokenization"""
         return query.lower().split()
     
-    def phrase_search(self, phrase: str, window: int = 0) -> List[Dict]:
-        """
-        Search for exact phrase or terms within a window
-        
-        Args:
-            phrase: Space-separated terms to search for
-            window: If 0, exact phrase; if >0, terms within window words
-        """
-        terms = phrase.split()
-        if len(terms) < 2:
-            return self.search_ranked(phrase)
-        
-        # Get all terms in the phrase
-        query_terms = [t.lower() for t in terms]
-        
-        # Find documents containing all terms
-        candidate_docs = set()
-        for term in query_terms:
-            if term in self.index:
-                if not candidate_docs:
-                    candidate_docs = set(self.index[term]['doc_ids'])
-                else:
-                    candidate_docs.intersection_update(self.index[term]['doc_ids'])
-        
-        results = []
-        for doc_id in candidate_docs:
-            # Get positions for each term
-            positions_list = []
-            valid = True
-            
-            for term in query_terms:
-                positions = self.get_term_positions(term, doc_id)
-                if not positions:
-                    valid = False
-                    break
-                positions_list.append(positions)
-            
-            if not valid:
-                continue
-            
-            # Check proximity
-            if window == 0:
-                # Exact phrase: positions must be consecutive
-                first_positions = positions_list[0]
-                for pos in first_positions:
-                    match = True
-                    for i in range(1, len(terms)):
-                        if pos + i not in positions_list[i]:
-                            match = False
-                            break
-                    if match:
-                        # Calculate BM25 score for ranking
-                        score = 0
-                        for term in query_terms:
-                            score += self.compute_bm25_score(term, doc_id)
-                        
-                        results.append({
-                            'doc_id': doc_id,
-                            'score': score,
-                            'match_type': 'exact_phrase',
-                            'metadata': self.doc_metadata.get(doc_id, {})
-                        })
-                        break
-            else:
-                # Proximity search: terms within window
-                # Implementation depends on your needs
-                pass
-        
-        # Sort by score
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results
-    
     def search_ranked(self, query: str, top_n: int = 10,
                      metadata_filter: Dict = None) -> List[Dict]:
         """
@@ -257,7 +177,7 @@ class BM25InvertedIndex:
                 return []
         
         # Score documents using min-heap for efficient top-n selection
-        score_heap = []  # Min-heap of (-score, doc_id) or (score, doc_id) for max
+        score_heap = []  # Min-heap of (score, doc_id, matched_terms)
         
         for doc_id in candidates:
             score = 0
@@ -285,9 +205,78 @@ class BM25InvertedIndex:
                 'matched_terms': matched_terms,
                 'metadata': self.doc_metadata.get(doc_id, {}),
                 'term_count': len(matched_terms),
-                'query_coverage': len(matched_terms) / len(query_terms)
+                'query_coverage': len(matched_terms) / len(query_terms) if query_terms else 0
             })
         
+        return results
+    
+    def phrase_search(self, phrase: str, window: int = 0) -> List[Dict]:
+        """
+        Search for exact phrase or terms within a window
+        
+        Args:
+            phrase: Space-separated terms to search for
+            window: If 0, exact phrase; if >0, terms within window words
+        """
+        terms = phrase.split()
+        if len(terms) < 2:
+            return self.search_ranked(phrase)
+        
+        # Get all terms in the phrase
+        query_terms = [t.lower() for t in terms]
+        
+        # Find documents containing all terms
+        candidate_docs = set()
+        for term in query_terms:
+            if term in self.index:
+                term_docs = set(self.index[term]['doc_ids'])
+                if not candidate_docs:
+                    candidate_docs = term_docs
+                else:
+                    candidate_docs.intersection_update(term_docs)
+        
+        results = []
+        for doc_id in candidate_docs:
+            # Get positions for each term
+            positions_list = []
+            valid = True
+            
+            for term in query_terms:
+                positions = self.get_term_positions(term, doc_id)
+                if not positions:
+                    valid = False
+                    break
+                positions_list.append(positions)
+            
+            if not valid:
+                continue
+            
+            # Check proximity
+            if window == 0:
+                # Exact phrase: positions must be consecutive
+                first_positions = positions_list[0]
+                for pos in first_positions:
+                    match = True
+                    for i in range(1, len(query_terms)):
+                        if pos + i not in positions_list[i]:
+                            match = False
+                            break
+                    if match:
+                        # Calculate BM25 score for ranking
+                        score = 0
+                        for term in query_terms:
+                            score += self.compute_bm25_score(term, doc_id)
+                        
+                        results.append({
+                            'doc_id': doc_id,
+                            'score': score,
+                            'match_type': 'exact_phrase',
+                            'metadata': self.doc_metadata.get(doc_id, {})
+                        })
+                        break
+        
+        # Sort by score
+        results.sort(key=lambda x: x['score'], reverse=True)
         return results
     
     def search_with_explanation(self, query: str, doc_id: str) -> Dict:
@@ -335,7 +324,6 @@ class BM25InvertedIndex:
             return {'error': f'Term "{term}" not found in index'}
         
         postings = self.index[term]['postings']
-        doc_ids = [p['doc_id'] for p in postings]
         
         return {
             'term': term,
@@ -351,6 +339,17 @@ class BM25InvertedIndex:
                 for p in postings[:10]  # First 10
             ]
         }
+    
+    def set_metadata(self, metadata_file: str):
+        """Load document metadata from a file"""
+        try:
+            with open(metadata_file, 'r') as f:
+                self.doc_metadata = json.load(f)
+            print(f"✅ Loaded metadata for {len(self.doc_metadata)} documents")
+        except FileNotFoundError:
+            print(f"⚠️ Metadata file {metadata_file} not found")
+        except Exception as e:
+            print(f"⚠️ Error loading metadata: {e}")
     
     def _get_preview(self, doc_id: str, length: int = 200) -> str:
         """Get document preview (you'll need to store document content)"""
@@ -385,7 +384,10 @@ if __name__ == "__main__":
         json.dump(bm25_ready_index, f)
         index_file = f.name
     
-    # Optional metadata
+    # Initialize BM25 index (without metadata first)
+    bm25 = BM25InvertedIndex(index_file)
+    
+    # Load metadata separately
     doc_metadata = {
         "q1_report_chunk3": {"title": "Q1 Revenue", "page": 5, "time_period": "Q1 2024"},
         "q1_report_chunk7": {"title": "Q1 Margins", "page": 7, "time_period": "Q1 2024"},
@@ -393,12 +395,12 @@ if __name__ == "__main__":
         "presentation_chunk5": {"title": "Growth Strategy", "page": 5, "time_period": "Q1 2024"}
     }
     
+    # Create metadata file
     with open('doc_metadata.json', 'w') as f:
         json.dump(doc_metadata, f)
     
-    # Initialize BM25 index
-    bm25 = BM25InvertedIndex(index_file)
-    bm25.doc_metadata = doc_metadata  # Add metadata
+    # Set metadata using the new method
+    bm25.set_metadata('doc_metadata.json')
     
     # Search
     results = bm25.search_ranked("revenue growth", top_n=5)
@@ -409,6 +411,22 @@ if __name__ == "__main__":
         print(f"{i}. Document: {r['doc_id']}")
         print(f"   Score: {r['score']}")
         print(f"   Matched terms: {', '.join(r['matched_terms'])}")
+        print(f"   Query coverage: {r['query_coverage']:.0%}")
+        print(f"   Metadata: {r['metadata']}")
+        print()
+    
+    # Search with metadata filter
+    print("\nFILTERED SEARCH (time_period = Q1 2024):")
+    print("=" * 50)
+    filtered_results = bm25.search_ranked(
+        "revenue", 
+        top_n=5,
+        metadata_filter={"time_period": "Q1 2024"}
+    )
+    
+    for i, r in enumerate(filtered_results, 1):
+        print(f"{i}. Document: {r['doc_id']}")
+        print(f"   Score: {r['score']}")
         print(f"   Metadata: {r['metadata']}")
         print()
     
@@ -421,17 +439,18 @@ if __name__ == "__main__":
     print(f"Average Document Length: {explanation['avg_doc_length']:.1f} words")
     print("\nTerm Contributions:")
     for term, details in explanation['terms'].items():
-        if details['tf'] > 0:
+        if details.get('tf', 0) > 0:
             print(f"  {term}: TF={details['tf']}, IDF={details['idf']}, Score={details['score']}")
-            if 'positions' in details:
+            if 'positions' in details and details['positions']:
                 print(f"     Positions: {details['positions']}")
     
-    # Get term statistics
-    print("\nTERM STATISTICS for 'revenue':")
-    stats = bm25.get_term_stats('revenue')
-    print(f"Document Frequency: {stats['document_frequency']}")
-    print(f"Total Occurrences: {stats['total_occurrences']}")
-    print(f"IDF: {stats['idf']:.4f}")
+    # Phrase search
+    print("\nPHRASE SEARCH (exact):")
+    print("=" * 50)
+    phrase_results = bm25.phrase_search("revenue growth", window=0)
+    for i, r in enumerate(phrase_results, 1):
+        print(f"{i}. Document: {r['doc_id']}")
+        print(f"   Score: {r['score']}")
     
     # Clean up
     os.unlink(index_file)
